@@ -322,6 +322,165 @@ func TestAWSCredsAssumeRoleFromDefaultProfile(t *testing.T) {
 	os.Unsetenv("AWS_SHARED_CREDENTIALS_FILE")
 }
 
+// Given:
+// 1. A web identity role ARN and token file are specified via the provider configuration
+//
+// This tests that: we assume the role via AssumeRoleWithWebIdentity using the token file.
+func TestAWSCredsAssumeRoleWithWebIdentity(t *testing.T) {
+	testRegion := "us-east-1"
+	webIdentityRoleArn := "arn:aws:iam::123456789012:role/demo/TestWebIdentity"
+	webIdentityAccessKeyID := "ASIAWEBIDENTITYEXAMPLE"
+
+	server := mockServer{
+		ResponseFixturePath:      "./test-fixtures/api_assume_role_with_web_identity_response.xml",
+		ExpectedRoleArn:          webIdentityRoleArn,
+		ExpectedWebIdentityToken: readTokenFixture(t, "./test-fixtures/web_identity_token"),
+	}
+
+	server.Start(t)
+	defer server.Stop()
+
+	testConfig := &ProviderConf{
+		awsWebIdentityRoleArn:   webIdentityRoleArn,
+		awsWebIdentityTokenFile: "./test-fixtures/web_identity_token",
+	}
+
+	creds := getCreds(t, testRegion, testConfig, server.Endpoint)
+
+	if creds.AccessKeyID != webIdentityAccessKeyID {
+		t.Errorf("access key id should have been %s (we got %s)", webIdentityAccessKeyID, creds.AccessKeyID)
+	}
+}
+
+// Given:
+// 1. AWS_ROLE_ARN and AWS_WEB_IDENTITY_TOKEN_FILE are set via environment variables (as EKS IRSA injects them)
+// 2. No AWS configuration is provided to the provider
+//
+// This tests that: the web identity provider args default from the standard AWS
+// environment variables, so IRSA autodiscovery works with no configuration.
+func TestAWSCredsWebIdentityAutodiscovery(t *testing.T) {
+	testRegion := "us-east-1"
+	webIdentityRoleArn := "arn:aws:iam::123456789012:role/demo/TestWebIdentity"
+	webIdentityAccessKeyID := "ASIAWEBIDENTITYEXAMPLE"
+
+	server := mockServer{
+		ResponseFixturePath:      "./test-fixtures/api_assume_role_with_web_identity_response.xml",
+		ExpectedRoleArn:          webIdentityRoleArn,
+		ExpectedWebIdentityToken: readTokenFixture(t, "./test-fixtures/web_identity_token"),
+	}
+
+	server.Start(t)
+	defer server.Stop()
+
+	os.Setenv("AWS_ROLE_ARN", webIdentityRoleArn)
+	os.Setenv("AWS_WEB_IDENTITY_TOKEN_FILE", "./test-fixtures/web_identity_token")
+
+	// Build the config through the provider schema so the DefaultFunc env-var
+	// discovery is exercised, exactly as it would be at runtime.
+	d := schema.TestResourceDataRaw(t, Provider().Schema, map[string]interface{}{})
+	testConfig := &ProviderConf{
+		awsWebIdentityRoleArn:    d.Get("aws_web_identity_role_arn").(string),
+		awsWebIdentityTokenFile:  d.Get("aws_web_identity_token_file").(string),
+		awsAssumeRoleSessionName: d.Get("aws_assume_role_session_name").(string),
+	}
+
+	creds := getCreds(t, testRegion, testConfig, server.Endpoint)
+
+	if creds.AccessKeyID != webIdentityAccessKeyID {
+		t.Errorf("access key id should have been %s (we got %s)", webIdentityAccessKeyID, creds.AccessKeyID)
+	}
+
+	os.Unsetenv("AWS_ROLE_ARN")
+	os.Unsetenv("AWS_WEB_IDENTITY_TOKEN_FILE")
+}
+
+// Given:
+// 1. A web identity role ARN and token file are configured
+// 2. aws_assume_role_arn is also configured
+//
+// This tests that: the web identity credentials are resolved first and then
+// used to sign the AssumeRole call for the second role (role chaining). We
+// assert on the ordering of STS actions and that the second call is signed with
+// the access key returned by the first (web identity) call.
+func TestAWSCredsWebIdentityChainedToAssumeRole(t *testing.T) {
+	testRegion := "us-east-1"
+	webIdentityRoleArn := "arn:aws:iam::123456789012:role/demo/TestWebIdentity"
+	chainedRoleArn := "arn:aws:iam::123456789012:role/demo/TestChainedRole"
+	webIdentityAccessKeyID := "ASIAWEBIDENTITYEXAMPLE"
+	chainedAccessKeyID := "ASIACHAINEDROLEEXAMPLE"
+	expectedToken := readTokenFixture(t, "./test-fixtures/web_identity_token")
+
+	var actions []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Errorf("Error while parsing form: %v", err)
+		}
+		action := r.PostForm.Get("Action")
+		actions = append(actions, action)
+
+		var fixture string
+		switch action {
+		case "AssumeRoleWithWebIdentity":
+			if r.PostForm.Get("RoleArn") != webIdentityRoleArn {
+				t.Errorf("web identity call: expected RoleArn %s, got %s", webIdentityRoleArn, r.PostForm.Get("RoleArn"))
+			}
+			if r.PostForm.Get("WebIdentityToken") != expectedToken {
+				t.Errorf("web identity call: expected token %s, got %s", expectedToken, r.PostForm.Get("WebIdentityToken"))
+			}
+			fixture = "./test-fixtures/api_assume_role_with_web_identity_response.xml"
+		case "AssumeRole":
+			if r.PostForm.Get("RoleArn") != chainedRoleArn {
+				t.Errorf("assume role call: expected RoleArn %s, got %s", chainedRoleArn, r.PostForm.Get("RoleArn"))
+			}
+			// The chained AssumeRole call must be signed with the web identity
+			// credentials, not the ambient environment. Verify the SigV4
+			// Authorization header carries the web identity access key.
+			auth := r.Header.Get("Authorization")
+			if !strings.Contains(auth, webIdentityAccessKeyID) {
+				t.Errorf("assume role call should be signed with web identity key %s, authorization header was %s", webIdentityAccessKeyID, auth)
+			}
+			fixture = "./test-fixtures/api_chained_assume_role_response.xml"
+		default:
+			t.Errorf("unexpected STS action: %s", action)
+			return
+		}
+
+		response, err := os.ReadFile(fixture)
+		if err != nil {
+			t.Errorf("Error while reading mockResponse %v", err)
+		}
+		w.WriteHeader(http.StatusOK)
+		if _, err = w.Write(response); err != nil {
+			t.Errorf("Error while writing mock server response %v", err)
+		}
+	}))
+	defer server.Close()
+
+	testConfig := &ProviderConf{
+		awsAssumeRoleArn:        chainedRoleArn,
+		awsWebIdentityRoleArn:   webIdentityRoleArn,
+		awsWebIdentityTokenFile: "./test-fixtures/web_identity_token",
+	}
+
+	creds := getCreds(t, testRegion, testConfig, server.URL)
+
+	if creds.AccessKeyID != chainedAccessKeyID {
+		t.Errorf("access key id should have been %s (we got %s)", chainedAccessKeyID, creds.AccessKeyID)
+	}
+
+	if len(actions) != 2 || actions[0] != "AssumeRoleWithWebIdentity" || actions[1] != "AssumeRole" {
+		t.Errorf("expected STS actions [AssumeRoleWithWebIdentity AssumeRole], got %v", actions)
+	}
+}
+
+func readTokenFixture(t *testing.T, path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("failed reading token fixture %s: %v", path, err)
+	}
+	return string(data)
+}
+
 func getCreds(t *testing.T, region string, config *ProviderConf, endpoint string) credentials.Value {
 	s := awsSession(region, config, endpoint)
 	if s == nil {
@@ -363,20 +522,23 @@ func TestAWSSocksProxy(t *testing.T) {
 }
 
 type mockServer struct {
-	ResponseFixturePath string
-	ExpectedAccessKeyId string
-	ExpectedRoleArn     string
-	ExpectedExternalId  string
-	Endpoint            string
-	server              *httptest.Server
+	ResponseFixturePath      string
+	ExpectedAccessKeyId      string
+	ExpectedRoleArn          string
+	ExpectedExternalId       string
+	ExpectedWebIdentityToken string
+	Endpoint                 string
+	server                   *httptest.Server
 }
 
 func (s *mockServer) Start(t *testing.T) {
 	s.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 
-		auth := r.Header.Get("Authorization")
-		if !strings.Contains(auth, s.ExpectedAccessKeyId) {
-			t.Errorf("Could not find expected access key id %s in authorization header %s", s.ExpectedAccessKeyId, auth)
+		if s.ExpectedAccessKeyId != "" {
+			auth := r.Header.Get("Authorization")
+			if !strings.Contains(auth, s.ExpectedAccessKeyId) {
+				t.Errorf("Could not find expected access key id %s in authorization header %s", s.ExpectedAccessKeyId, auth)
+			}
 		}
 
 		err := r.ParseForm()
@@ -388,8 +550,12 @@ func (s *mockServer) Start(t *testing.T) {
 			t.Errorf("expected RoleArn to be equal to %s, but got %s", s.ExpectedRoleArn, r.PostForm.Get("RoleArn"))
 		}
 
-		if r.PostForm.Get("ExternalId") != s.ExpectedExternalId {
+		if s.ExpectedExternalId != "" && r.PostForm.Get("ExternalId") != s.ExpectedExternalId {
 			t.Errorf("expected ExternalId to be equal to %s, but got %s", s.ExpectedExternalId, r.PostForm.Get("ExternalId"))
+		}
+
+		if s.ExpectedWebIdentityToken != "" && r.PostForm.Get("WebIdentityToken") != s.ExpectedWebIdentityToken {
+			t.Errorf("expected WebIdentityToken to be equal to %s, but got %s", s.ExpectedWebIdentityToken, r.PostForm.Get("WebIdentityToken"))
 		}
 
 		response, err := os.ReadFile(s.ResponseFixturePath)
